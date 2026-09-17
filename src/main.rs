@@ -1,5 +1,6 @@
 mod app;
 mod history;
+mod keyboard;
 mod test;
 mod ui;
 mod words;

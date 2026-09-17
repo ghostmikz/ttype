@@ -38,6 +38,7 @@ ttype -l mn        # mongolian (switch your keyboard layout first)
 | `←` `→` | cycle test mode |
 | `↑` `↓` | switch language |
 | `ctrl+backspace` / `ctrl+w` | delete word |
+| `h` | results: chart / heatmap / all-time heatmap |
 | `esc` | quit |
 
 The timer starts on your first keystroke. A word you typed correctly is locked
@@ -52,6 +53,19 @@ in; backspace can only step back into a word you got wrong.
 - **characters**: correct / incorrect / extra / missed
 - **missed keys**: which characters you fumbled most
 
+Press `h` on the results screen to cycle between the speed chart and two
+keyboard heatmaps, drawn on QWERTY for English and the standard Mongolian
+Cyrillic layout for Mongolian:
+
+- **this test**: each key coloured by how many times you missed it
+- **all time**: each key coloured by its error rate across every saved run in
+  that language (a key needs 20+ attempts before it's ranked, so one unlucky
+  miss on a rare letter doesn't dominate)
+
+A miss is charged to the key you *should* have pressed, including letters you
+skipped by hitting space early. Extra characters past the end of a word don't
+count against any key.
+
 Every run is appended to `~/.local/share/ttype/history.jsonl`, and your best
 for the current mode + language is shown before each test.
 
@@ -61,4 +75,5 @@ for the current mode + language is shown before each test.
 cargo run -- -w 10
 cargo test
 cargo test preview -- --ignored --nocapture   # render screens as text
+TTYPE_PREVIEW=/tmp/ttype.html cargo test html_preview -- --ignored   # heatmaps with colour
 ```

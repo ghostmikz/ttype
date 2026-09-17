@@ -1,26 +1,51 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::history::History;
-use crate::test::{MODES, Mode, Summary, Test};
+use crate::test::{KeyStat, MODES, Mode, Summary, Test};
 use crate::ui;
 use crate::words::Lang;
 
 const FRAME: Duration = Duration::from_millis(50);
+
+/// what fills the middle of the results screen; `h` cycles through them
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResultView {
+    Chart,
+    Heatmap,
+    AllTime,
+}
+
+impl ResultView {
+    fn next(self) -> ResultView {
+        match self {
+            ResultView::Chart => ResultView::Heatmap,
+            ResultView::Heatmap => ResultView::AllTime,
+            ResultView::AllTime => ResultView::Chart,
+        }
+    }
+}
 
 pub enum Screen {
     Typing,
     Results {
         summary: Summary,
         previous_best: Option<f64>,
+        view: ResultView,
+        /// key stats over every saved run in this language, this one included
+        all_time: BTreeMap<char, KeyStat>,
+        all_time_runs: usize,
     },
 }
 
 pub struct App {
     pub test: Test,
     pub screen: Screen,
+    /// kept across tests so the heatmap stays up if that's what you were looking at
+    view: ResultView,
     /// personal best for the current mode + language, shown before a test starts
     pub best: Option<f64>,
     history: History,
@@ -34,6 +59,7 @@ impl App {
         App {
             test: Test::new(mode, lang),
             screen: Screen::Typing,
+            view: ResultView::Chart,
             best,
             history,
             quit: false,
@@ -68,9 +94,13 @@ impl App {
         let previous_best = self.best;
         // a write failure (read-only home, full disk) just means this run isn't saved
         let _ = self.history.add(&summary);
+        let (all_time, all_time_runs) = self.history.key_totals(summary.lang.code());
         self.screen = Screen::Results {
             summary,
             previous_best,
+            view: self.view,
+            all_time,
+            all_time_runs,
         };
     }
 
@@ -90,11 +120,16 @@ impl App {
             KeyCode::Left => self.cycle_mode(-1),
             KeyCode::Right => self.cycle_mode(1),
             KeyCode::Up | KeyCode::Down => self.restart(mode, lang.toggle()),
-            _ if matches!(self.screen, Screen::Results { .. }) => {
-                if key.code == KeyCode::Enter {
-                    self.restart(mode, lang);
+            _ if matches!(self.screen, Screen::Results { .. }) => match key.code {
+                KeyCode::Enter => self.restart(mode, lang),
+                KeyCode::Char('h') => {
+                    if let Screen::Results { view, .. } = &mut self.screen {
+                        *view = view.next();
+                        self.view = *view;
+                    }
                 }
-            }
+                _ => {}
+            },
             // terminals send ctrl+backspace as ctrl+h, ctrl+w or backspace+ctrl/alt
             KeyCode::Backspace if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {
                 self.test.delete_word()
@@ -165,7 +200,113 @@ mod tests {
             app.test.start = Some(Instant::now() - Duration::from_secs(30));
             app.test.tick();
             app.show_results();
-            println!("{}\n", render(&app));
+            for _ in 0..3 {
+                println!("{}\n", render(&app));
+                press(&mut app, "h");
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod html_preview {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
+
+    fn css(c: Color, default: &str) -> String {
+        match c {
+            Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+            _ => default.to_string(),
+        }
+    }
+
+    /// TTYPE_PREVIEW=out.html cargo test html_preview -- --ignored
+    #[test]
+    #[ignore]
+    fn html_preview() {
+        let out = std::env::var("TTYPE_PREVIEW").expect("set TTYPE_PREVIEW");
+        let mut html = String::from(
+            "<body style='background:#282c34;margin:0'><pre style='font:15px/19px monospace;margin:12px'>",
+        );
+        for lang in [Lang::En, Lang::Mn] {
+            let mut app = App::new(Mode::Words(25), lang);
+            let sample: &[(char, u32, u32)] = match lang {
+                Lang::En => &[
+                    ('e', 9, 4),
+                    ('r', 5, 3),
+                    ('t', 7, 1),
+                    ('a', 6, 0),
+                    ('o', 6, 2),
+                    ('n', 4, 0),
+                    ('s', 3, 1),
+                    ('i', 5, 0),
+                    ('h', 3, 0),
+                    ('l', 3, 0),
+                ],
+                Lang::Mn => &[
+                    ('ө', 6, 4),
+                    ('ү', 5, 2),
+                    ('а', 9, 1),
+                    ('н', 6, 0),
+                    ('х', 4, 3),
+                    ('р', 5, 0),
+                    ('ж', 2, 1),
+                    ('л', 4, 0),
+                    ('г', 3, 0),
+                ],
+            };
+            let keys: BTreeMap<char, KeyStat> = sample
+                .iter()
+                .map(|&(c, attempts, misses)| (c, KeyStat { attempts, misses }))
+                .collect();
+            let mut summary = app.test.summary();
+            summary.keys = keys.clone();
+            let all_time: BTreeMap<char, KeyStat> = keys
+                .iter()
+                .map(|(&c, k)| {
+                    (
+                        c,
+                        KeyStat {
+                            attempts: k.attempts * 12,
+                            misses: k.misses * 7 + 3,
+                        },
+                    )
+                })
+                .collect();
+            for view in [ResultView::Heatmap, ResultView::AllTime] {
+                app.screen = Screen::Results {
+                    summary: summary.clone(),
+                    previous_best: Some(90.0),
+                    view,
+                    all_time: all_time.clone(),
+                    all_time_runs: 14,
+                };
+                let mut term = Terminal::new(TestBackend::new(96, 26)).unwrap();
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let buf = term.backend().buffer();
+                for y in 0..buf.area.height {
+                    for x in 0..buf.area.width {
+                        let cell = &buf[(x, y)];
+                        let sym = match cell.symbol() {
+                            "<" => "&lt;",
+                            ">" => "&gt;",
+                            "&" => "&amp;",
+                            s => s,
+                        };
+                        html.push_str(&format!(
+                            "<span style='color:{};background:{}'>{}</span>",
+                            css(cell.fg, "#abb2bf"),
+                            css(cell.bg, "transparent"),
+                            sym
+                        ));
+                    }
+                    html.push('\n');
+                }
+                html.push_str("<hr style='border-color:#3e4451'>");
+            }
+        }
+        std::fs::write(out, html + "</pre></body>").unwrap();
     }
 }

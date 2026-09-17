@@ -5,8 +5,11 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Chart, Dataset, GraphType, Paragraph};
 
-use crate::app::{App, Screen};
-use crate::test::{MODES, Mode, Summary, Test};
+use std::collections::BTreeMap;
+
+use crate::app::{App, ResultView, Screen};
+use crate::keyboard::{self, Scale};
+use crate::test::{KeyStat, MODES, Mode, Summary, Test};
 use crate::words::Lang;
 
 // One Dark
@@ -37,7 +40,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Results {
             summary,
             previous_best,
-        } => draw_results(frame, body, summary, *previous_best),
+            view,
+            all_time,
+            all_time_runs,
+        } => draw_results(
+            frame,
+            body,
+            summary,
+            *previous_best,
+            *view,
+            all_time,
+            *all_time_runs,
+        ),
     }
     draw_footer(frame, footer, &app.screen);
 }
@@ -84,6 +98,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, screen: &Screen) {
         ],
         Screen::Results { .. } => &[
             ("tab/enter", "next test"),
+            ("h", "chart/heatmap"),
             ("←→", "mode"),
             ("↑↓", "language"),
             ("esc", "quit"),
@@ -232,9 +247,17 @@ fn word_spans(test: &Test, i: usize) -> Vec<Span<'static>> {
     spans
 }
 
-fn draw_results(frame: &mut Frame, area: Rect, s: &Summary, previous_best: Option<f64>) {
+fn draw_results(
+    frame: &mut Frame,
+    area: Rect,
+    s: &Summary,
+    previous_best: Option<f64>,
+    view: ResultView,
+    all_time: &BTreeMap<char, KeyStat>,
+    all_time_runs: usize,
+) {
     let width = 80.min(area.width);
-    let height = 20.min(area.height);
+    let height = 21.min(area.height);
     let box_area = centered(area, width, height);
     let [top, _, chart_area, _, bottom] = Layout::vertical([
         Constraint::Length(4),
@@ -299,35 +322,81 @@ fn draw_results(frame: &mut Frame, area: Rect, s: &Summary, previous_best: Optio
         right,
     );
 
-    let [legend, chart_area] =
+    let [legend, middle] =
         Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(chart_area);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("── ", Style::new().fg(ACCENT)),
-            Span::styled("wpm   ", Style::new().fg(DIM)),
-            Span::styled("── ", Style::new().fg(FAINT)),
-            Span::styled("raw   ", Style::new().fg(DIM)),
-            Span::styled("• ", Style::new().fg(RED)),
-            Span::styled("errors", Style::new().fg(DIM)),
-        ]))
-        .alignment(Alignment::Right),
-        legend,
-    );
-    draw_chart(frame, chart_area, s);
+    let (keys, scale) = match view {
+        ResultView::Chart => {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("── ", Style::new().fg(ACCENT)),
+                    Span::styled("wpm   ", Style::new().fg(DIM)),
+                    Span::styled("── ", Style::new().fg(FAINT)),
+                    Span::styled("raw   ", Style::new().fg(DIM)),
+                    Span::styled("• ", Style::new().fg(RED)),
+                    Span::styled("errors", Style::new().fg(DIM)),
+                ]))
+                .alignment(Alignment::Right),
+                legend,
+            );
+            draw_chart(frame, middle, s);
+            (&s.keys, Scale::Count)
+        }
+        ResultView::Heatmap => {
+            let title = "missed keys · this test";
+            frame.render_widget(heading(title), legend);
+            keyboard::draw(frame, middle, s.lang, &s.keys, Scale::Count);
+            (&s.keys, Scale::Count)
+        }
+        ResultView::AllTime => {
+            let runs = if all_time_runs == 1 { "run" } else { "runs" };
+            let title = format!(
+                "error rate · all {} {} in {}",
+                all_time_runs,
+                runs,
+                s.lang.code()
+            );
+            frame.render_widget(heading(&title), legend);
+            keyboard::draw(frame, middle, s.lang, all_time, Scale::Rate);
+            (all_time, Scale::Rate)
+        }
+    };
 
-    // ---- most missed keys
-    let mut spans = vec![Span::styled("missed keys  ", Style::new().fg(DIM))];
-    if s.missed_keys.is_empty() {
-        spans.push(Span::styled("none", Style::new().fg(GREEN)));
+    // ---- worst keys, as text
+    let ranked = keyboard::worst(keys, &scale);
+    let mut spans = vec![Span::styled(
+        match scale {
+            Scale::Count => "missed keys   ",
+            Scale::Rate => "weakest keys  ",
+        },
+        Style::new().fg(DIM),
+    )];
+    if ranked.is_empty() {
+        let msg = match scale {
+            Scale::Count => "none".to_string(),
+            Scale::Rate => format!(
+                "none yet (a key needs {}+ attempts to rank)",
+                keyboard::MIN_ATTEMPTS
+            ),
+        };
+        spans.push(Span::styled(msg, Style::new().fg(GREEN)));
     }
-    for (c, n) in s.missed_keys.iter().take(10) {
+    for (c, k) in ranked.iter().take(8) {
         spans.push(Span::styled(
             c.to_string(),
             Style::new().fg(RED).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(format!("×{n}  "), Style::new().fg(DIM)));
+        let detail = match scale {
+            Scale::Count => format!("×{}  ", k.misses),
+            Scale::Rate => format!(" {:.0}%  ", k.rate() * 100.0),
+        };
+        spans.push(Span::styled(detail, Style::new().fg(DIM)));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), bottom);
+}
+
+fn heading(title: &str) -> Paragraph<'_> {
+    Paragraph::new(Line::from(Span::styled(title, Style::new().fg(DIM))))
+        .alignment(Alignment::Center)
 }
 
 fn draw_chart(frame: &mut Frame, area: Rect, s: &Summary) {

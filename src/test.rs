@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::words::{self, Lang, Rng};
@@ -58,6 +58,27 @@ pub struct CharCounts {
     pub missed: u32,
 }
 
+/// per-key tallies, keyed by the character that should have been typed
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct KeyStat {
+    pub attempts: u32,
+    pub misses: u32,
+}
+
+impl KeyStat {
+    pub fn rate(&self) -> f64 {
+        if self.attempts == 0 {
+            return 0.0;
+        }
+        self.misses as f64 / self.attempts as f64
+    }
+
+    pub fn add(&mut self, other: KeyStat) {
+        self.attempts += other.attempts;
+        self.misses += other.misses;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Summary {
     pub mode: Mode,
@@ -69,8 +90,7 @@ pub struct Summary {
     pub seconds: f64,
     pub chars: CharCounts,
     pub samples: Vec<Sample>,
-    /// expected character -> times it was mistyped, most missed first
-    pub missed_keys: Vec<(char, u32)>,
+    pub keys: BTreeMap<char, KeyStat>,
 }
 
 pub struct Test {
@@ -86,7 +106,7 @@ pub struct Test {
     sec_chars: u32,
     sec_errors: u32,
     samples: Vec<Sample>,
-    missed: HashMap<char, u32>,
+    keys: BTreeMap<char, KeyStat>,
     rng: Rng,
 }
 
@@ -109,7 +129,7 @@ impl Test {
             sec_chars: 0,
             sec_errors: 0,
             samples: Vec::new(),
-            missed: HashMap::new(),
+            keys: BTreeMap::new(),
             rng,
         }
     }
@@ -152,11 +172,13 @@ impl Test {
         self.start.get_or_insert_with(Instant::now);
 
         let pos = typed.len();
-        let wrong = word.get(pos) != Some(&c);
-        if wrong {
-            // count against the key that should have been pressed
-            let expected = word.get(pos).copied().unwrap_or(c);
-            *self.missed.entry(expected).or_default() += 1;
+        let expected = word.get(pos).copied();
+        let wrong = expected != Some(c);
+        // extra characters past the word's end aren't a miss on any particular key
+        if let Some(e) = expected {
+            let stat = self.keys.entry(e).or_default();
+            stat.attempts += 1;
+            stat.misses += wrong as u32;
         }
         self.record(wrong);
         self.typed[i].push(c);
@@ -178,7 +200,9 @@ impl Test {
         self.record(wrong);
         if wrong {
             for &c in self.words[i].iter().skip(self.typed[i].len()) {
-                *self.missed.entry(c).or_default() += 1;
+                let stat = self.keys.entry(c).or_default();
+                stat.attempts += 1;
+                stat.misses += 1;
             }
         }
         if i + 1 == self.words.len()
@@ -337,9 +361,6 @@ impl Test {
         let typed_chars: usize = self.typed.iter().map(Vec::len).sum::<usize>() + cur;
         let raws: Vec<f64> = self.samples.iter().map(|s| s.raw).collect();
 
-        let mut missed_keys: Vec<(char, u32)> = self.missed.iter().map(|(&c, &n)| (c, n)).collect();
-        missed_keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
         Summary {
             mode: self.mode,
             lang: self.lang,
@@ -350,7 +371,7 @@ impl Test {
             seconds,
             chars,
             samples: self.samples.clone(),
-            missed_keys,
+            keys: self.keys.clone(),
         }
     }
 }
@@ -402,8 +423,23 @@ mod tests {
         let s = t.summary();
         assert_eq!(s.chars.missed, 2);
         assert_eq!(t.correct_chars(), 5);
-        assert!(s.missed_keys.contains(&('l', 1)));
-        assert!(s.missed_keys.contains(&('o', 1)));
+        let miss = |c| s.keys.get(&c).copied().unwrap_or_default();
+        // "hel" then space: the skipped l and o are misses, h e l were clean
+        assert_eq!(
+            miss('l'),
+            KeyStat {
+                attempts: 3,
+                misses: 1
+            }
+        );
+        assert_eq!(
+            miss('o'),
+            KeyStat {
+                attempts: 2,
+                misses: 1
+            }
+        );
+        assert_eq!(miss('h').misses, 0);
     }
 
     #[test]
@@ -426,6 +462,23 @@ mod tests {
         t.delete_word();
         assert!(t.typed[0].is_empty());
         assert_eq!(t.current(), 0);
+    }
+
+    #[test]
+    fn typo_is_charged_to_the_expected_key() {
+        let mut t = fixed(&["cat", "dog"], Mode::Words(2));
+        type_str(&mut t, "cst");
+        assert_eq!(
+            t.keys[&'a'],
+            KeyStat {
+                attempts: 1,
+                misses: 1
+            }
+        );
+        assert!(!t.keys.contains_key(&'s'));
+        // overflow characters count as extras, not key misses
+        type_str(&mut t, "zz");
+        assert_eq!(t.keys.values().map(|k| k.attempts).sum::<u32>(), 3);
     }
 
     #[test]
