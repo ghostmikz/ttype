@@ -1,15 +1,18 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::history::History;
 use crate::test::{KeyStat, MODES, Mode, Summary, Test};
-use crate::ui;
-use crate::words::Lang;
+use crate::ui::{self, motion::Motion};
 
-const FRAME: Duration = Duration::from_millis(50);
+/// redraw interval while idle (the timer still needs to tick)
+const IDLE_FRAME: Duration = Duration::from_millis(50);
+/// redraw interval while the caret or text is gliding
+const ANIMATION_FRAME: Duration = Duration::from_millis(8);
 
 /// what fills the middle of the results screen; `h` cycles through them
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -29,38 +32,45 @@ impl ResultView {
     }
 }
 
+pub struct Results {
+    pub summary: Summary,
+    pub previous_best: Option<f64>,
+    pub view: ResultView,
+    /// key stats over every saved run, this one included
+    pub all_time: BTreeMap<char, KeyStat>,
+    pub all_time_runs: usize,
+}
+
 pub enum Screen {
     Typing,
-    Results {
-        summary: Summary,
-        previous_best: Option<f64>,
-        view: ResultView,
-        /// key stats over every saved run in this language, this one included
-        all_time: BTreeMap<char, KeyStat>,
-        all_time_runs: usize,
-    },
+    Results(Results),
 }
 
 pub struct App {
     pub test: Test,
     pub screen: Screen,
+    /// personal best for the current mode, shown before a test starts
+    pub best: Option<f64>,
+    /// eased caret/scroll positions; drawing advances them, hence the RefCell
+    pub motion: RefCell<Motion>,
     /// kept across tests so the heatmap stays up if that's what you were looking at
     view: ResultView,
-    /// personal best for the current mode + language, shown before a test starts
-    pub best: Option<f64>,
     history: History,
     quit: bool,
 }
 
 impl App {
-    pub fn new(mode: Mode, lang: Lang) -> App {
-        let history = History::load();
-        let best = history.best(&mode.key(), lang.code());
+    pub fn new(mode: Mode) -> App {
+        App::with_history(mode, History::load())
+    }
+
+    fn with_history(mode: Mode, history: History) -> App {
         App {
-            test: Test::new(mode, lang),
+            test: Test::new(mode),
             screen: Screen::Typing,
+            best: history.best(&mode.key()),
+            motion: RefCell::default(),
             view: ResultView::Chart,
-            best,
             history,
             quit: false,
         }
@@ -69,11 +79,24 @@ impl App {
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         while !self.quit {
             terminal.draw(|f| ui::draw(f, &self))?;
-            if event::poll(FRAME)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.on_key(key);
+            let wait = if self.motion.borrow().animating(Instant::now()) {
+                ANIMATION_FRAME
+            } else {
+                IDLE_FRAME
+            };
+            // handle everything already queued before drawing again, so fast
+            // typing never falls a frame per key behind
+            if event::poll(wait)? {
+                loop {
+                    if let Event::Key(key) = event::read()?
+                        && key.kind == KeyEventKind::Press
+                    {
+                        self.on_key(key);
+                    }
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
             }
             self.test.tick();
             if matches!(self.screen, Screen::Typing) && self.test.is_finished() {
@@ -83,10 +106,11 @@ impl App {
         Ok(())
     }
 
-    fn restart(&mut self, mode: Mode, lang: Lang) {
-        self.test = Test::new(mode, lang);
-        self.best = self.history.best(&mode.key(), lang.code());
+    fn restart(&mut self, mode: Mode) {
+        self.test = Test::new(mode);
+        self.best = self.history.best(&mode.key());
         self.screen = Screen::Typing;
+        self.motion.borrow_mut().reset();
     }
 
     fn show_results(&mut self) {
@@ -94,38 +118,37 @@ impl App {
         let previous_best = self.best;
         // a write failure (read-only home, full disk) just means this run isn't saved
         let _ = self.history.add(&summary);
-        let (all_time, all_time_runs) = self.history.key_totals(summary.lang.code());
-        self.screen = Screen::Results {
+        let (all_time, all_time_runs) = self.history.key_totals();
+        self.screen = Screen::Results(Results {
             summary,
             previous_best,
             view: self.view,
             all_time,
             all_time_runs,
-        };
+        });
     }
 
     fn cycle_mode(&mut self, step: isize) {
         let i = MODES.iter().position(|m| *m == self.test.mode).unwrap_or(0) as isize;
         let next = MODES[(i + step).rem_euclid(MODES.len() as isize) as usize];
-        self.restart(next, self.test.lang);
+        self.restart(next);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let (mode, lang) = (self.test.mode, self.test.lang);
+        let mode = self.test.mode;
         match key.code {
             KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Tab => self.restart(mode, lang),
+            KeyCode::Tab => self.restart(mode),
             KeyCode::Left => self.cycle_mode(-1),
             KeyCode::Right => self.cycle_mode(1),
-            KeyCode::Up | KeyCode::Down => self.restart(mode, lang.toggle()),
-            _ if matches!(self.screen, Screen::Results { .. }) => match key.code {
-                KeyCode::Enter => self.restart(mode, lang),
+            _ if matches!(self.screen, Screen::Results(_)) => match key.code {
+                KeyCode::Enter => self.restart(mode),
                 KeyCode::Char('h') => {
-                    if let Screen::Results { view, .. } = &mut self.screen {
-                        *view = view.next();
-                        self.view = *view;
+                    if let Screen::Results(r) = &mut self.screen {
+                        r.view = r.view.next();
+                        self.view = r.view;
                     }
                 }
                 _ => {}
@@ -147,7 +170,12 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::time::Instant;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Modifier};
+
+    fn app(mode: Mode) -> App {
+        App::with_history(mode, History::empty())
+    }
 
     fn press(app: &mut App, s: &str) {
         for c in s.chars() {
@@ -155,65 +183,106 @@ mod tests {
         }
     }
 
-    fn render(app: &App) -> String {
-        let mut term = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    fn render(app: &App, w: u16, h: u16) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::draw(f, app)).unwrap();
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        term.backend().buffer().clone()
     }
 
-    /// cargo test preview -- --ignored --nocapture
+    /// type the first `n` words, fumbling a couple of them
+    fn type_some(app: &mut App, n: usize) {
+        let words: Vec<String> = app
+            .test
+            .words
+            .iter()
+            .take(n)
+            .map(|w| w.iter().collect())
+            .collect();
+        for (i, w) in words.iter().enumerate() {
+            let typed = match i {
+                2 => w[..w.len() - 1].to_string(),
+                5 => format!("{w}xx"),
+                _ => w.clone(),
+            };
+            press(app, &format!("{typed} "));
+        }
+    }
+
+    fn finished() -> App {
+        let mut app = app(Mode::Time(30));
+        type_some(&mut app, 14);
+        app.test.start = Some(Instant::now() - Duration::from_secs(30));
+        app.test.tick();
+        app.show_results();
+        app
+    }
+
+    fn caret_cell(buf: &Buffer) -> Option<(u16, u16)> {
+        let i = buf.content().iter().position(|c| {
+            c.modifier.contains(Modifier::UNDERLINED) && c.underline_color == ui::ACCENT
+        })?;
+        Some((i as u16 % buf.area.width, i as u16 / buf.area.width))
+    }
+
     #[test]
-    #[ignore]
-    fn preview() {
-        for lang in [Lang::En, Lang::Mn] {
-            let mut app = App::new(Mode::Time(30), lang);
-            app.best = Some(98.0);
-            println!("{}\n", render(&app));
+    fn every_screen_renders_at_every_size() {
+        for (w, h) in [(20, 8), (40, 12), (80, 24), (120, 36), (211, 53), (300, 80)] {
+            let mut a = app(Mode::Words(25));
+            render(&a, w, h);
+            type_some(&mut a, 8);
+            render(&a, w, h);
 
-            let words: Vec<String> = app
-                .test
-                .words
-                .iter()
-                .take(12)
-                .map(|w| w.iter().collect())
-                .collect();
-            for (i, w) in words.iter().enumerate() {
-                // make a few mistakes: drop a letter, add extras
-                let typed = match i {
-                    2 => w[..w.len() - w.chars().last().unwrap().len_utf8()].to_string(),
-                    5 => format!("{w}xx"),
-                    _ => w.clone(),
-                };
-                press(&mut app, &format!("{typed} "));
-            }
-            press(&mut app, "q");
-            println!("{}\n", render(&app));
-
-            app.test.start = Some(Instant::now() - Duration::from_secs(30));
-            app.test.tick();
-            app.show_results();
+            let mut a = finished();
             for _ in 0..3 {
-                println!("{}\n", render(&app));
-                press(&mut app, "h");
+                render(&a, w, h);
+                press(&mut a, "h");
             }
         }
     }
-}
 
-#[cfg(test)]
-mod html_preview {
-    use super::*;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::style::Color;
+    #[test]
+    fn normal_text_widens_with_the_terminal() {
+        let a = app(Mode::Words(100));
+        let longest_line = |buf: &Buffer| {
+            (0..buf.area.height)
+                .map(|y| {
+                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    row.trim().len()
+                })
+                .max()
+                .unwrap()
+        };
+        let narrow = longest_line(&render(&a, 80, 24));
+        let wide = longest_line(&render(&a, 160, 40));
+        assert!(wide > narrow + 20, "{narrow} -> {wide}");
+    }
+
+    #[test]
+    fn caret_glides_instead_of_jumping() {
+        let mut a = app(Mode::Words(25));
+        let (start, row) = caret_cell(&render(&a, 100, 30)).unwrap();
+        let word: String = a.test.words[0].iter().collect();
+        press(&mut a, &format!("{word} "));
+        let target = start + word.len() as u16 + 1;
+
+        // right after the keypress it has only started moving
+        let (moving, _) = caret_cell(&render(&a, 100, 30)).unwrap();
+        assert!(moving < target, "caret teleported to {moving}");
+
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(caret_cell(&render(&a, 100, 30)).unwrap(), (target, row));
+        assert!(!a.motion.borrow().animating(Instant::now()));
+    }
+
+    #[test]
+    fn restart_puts_caret_straight_back() {
+        let mut a = app(Mode::Words(25));
+        let home = caret_cell(&render(&a, 100, 30)).unwrap();
+        type_some(&mut a, 3);
+        render(&a, 100, 30);
+        a.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(caret_cell(&render(&a, 100, 30)).unwrap(), home);
+    }
 
     fn css(c: Color, default: &str) -> String {
         match c {
@@ -222,90 +291,81 @@ mod html_preview {
         }
     }
 
-    /// TTYPE_PREVIEW=out.html cargo test html_preview -- --ignored
+    fn to_html(buf: &Buffer) -> String {
+        let mut html = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                let sym = match cell.symbol() {
+                    "<" => "&lt;",
+                    ">" => "&gt;",
+                    "&" => "&amp;",
+                    s => s,
+                };
+                let underline = if cell.modifier.contains(Modifier::UNDERLINED) {
+                    format!(
+                        ";text-decoration:underline {}",
+                        css(cell.underline_color, "currentColor")
+                    )
+                } else {
+                    String::new()
+                };
+                html.push_str(&format!(
+                    "<span style='color:{};background:{}{underline}'>{sym}</span>",
+                    css(cell.fg, "#abb2bf"),
+                    css(cell.bg, "transparent"),
+                ));
+            }
+            html.push('\n');
+        }
+        html
+    }
+
+    /// TTYPE_PREVIEW=out.html [TTYPE_PREVIEW_SIZE=211x53] cargo test html_preview -- --ignored
     #[test]
     #[ignore]
     fn html_preview() {
         let out = std::env::var("TTYPE_PREVIEW").expect("set TTYPE_PREVIEW");
+        let (w, h): (u16, u16) = std::env::var("TTYPE_PREVIEW_SIZE")
+            .ok()
+            .and_then(|s| {
+                let (a, b) = s.split_once('x')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            })
+            .unwrap_or((211, 53));
         let mut html = String::from(
-            "<body style='background:#282c34;margin:0'><pre style='font:15px/19px monospace;margin:12px'>",
+            "<body style='background:#282c34;margin:0'><pre style='font:10px/12px 'DejaVu Sans Mono',monospace;margin:8px'>",
         );
-        for lang in [Lang::En, Lang::Mn] {
-            let mut app = App::new(Mode::Words(25), lang);
-            let sample: &[(char, u32, u32)] = match lang {
-                Lang::En => &[
-                    ('e', 9, 4),
-                    ('r', 5, 3),
-                    ('t', 7, 1),
-                    ('a', 6, 0),
-                    ('o', 6, 2),
-                    ('n', 4, 0),
-                    ('s', 3, 1),
-                    ('i', 5, 0),
-                    ('h', 3, 0),
-                    ('l', 3, 0),
-                ],
-                Lang::Mn => &[
-                    ('ө', 6, 4),
-                    ('ү', 5, 2),
-                    ('а', 9, 1),
-                    ('н', 6, 0),
-                    ('х', 4, 3),
-                    ('р', 5, 0),
-                    ('ж', 2, 1),
-                    ('л', 4, 0),
-                    ('г', 3, 0),
-                ],
-            };
-            let keys: BTreeMap<char, KeyStat> = sample
+        let hr = "<hr style='border-color:#3e4451'>";
+
+        let mut a = app(Mode::Words(50));
+        type_some(&mut a, 16);
+        press(&mut a, "wor");
+        render(&a, w, h);
+        std::thread::sleep(Duration::from_millis(200));
+        html += &to_html(&render(&a, w, h));
+        html += hr;
+
+        let mut a = finished();
+        if let Screen::Results(r) = &mut a.screen {
+            let sample = [
+                ('e', 9, 4),
+                ('r', 5, 3),
+                ('t', 7, 1),
+                ('a', 6, 0),
+                ('o', 6, 2),
+                ('s', 3, 1),
+                ('i', 5, 0),
+            ];
+            r.summary.keys = sample
                 .iter()
                 .map(|&(c, attempts, misses)| (c, KeyStat { attempts, misses }))
                 .collect();
-            let mut summary = app.test.summary();
-            summary.keys = keys.clone();
-            let all_time: BTreeMap<char, KeyStat> = keys
-                .iter()
-                .map(|(&c, k)| {
-                    (
-                        c,
-                        KeyStat {
-                            attempts: k.attempts * 12,
-                            misses: k.misses * 7 + 3,
-                        },
-                    )
-                })
-                .collect();
-            for view in [ResultView::Heatmap, ResultView::AllTime] {
-                app.screen = Screen::Results {
-                    summary: summary.clone(),
-                    previous_best: Some(90.0),
-                    view,
-                    all_time: all_time.clone(),
-                    all_time_runs: 14,
-                };
-                let mut term = Terminal::new(TestBackend::new(96, 26)).unwrap();
-                term.draw(|f| ui::draw(f, &app)).unwrap();
-                let buf = term.backend().buffer();
-                for y in 0..buf.area.height {
-                    for x in 0..buf.area.width {
-                        let cell = &buf[(x, y)];
-                        let sym = match cell.symbol() {
-                            "<" => "&lt;",
-                            ">" => "&gt;",
-                            "&" => "&amp;",
-                            s => s,
-                        };
-                        html.push_str(&format!(
-                            "<span style='color:{};background:{}'>{}</span>",
-                            css(cell.fg, "#abb2bf"),
-                            css(cell.bg, "transparent"),
-                            sym
-                        ));
-                    }
-                    html.push('\n');
-                }
-                html.push_str("<hr style='border-color:#3e4451'>");
-            }
+        }
+        for _ in 0..2 {
+            html += &to_html(&render(&a, w, h));
+            html += hr;
+            press(&mut a, "h");
         }
         std::fs::write(out, html + "</pre></body>").unwrap();
     }

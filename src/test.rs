@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::words::{self, Lang, Rng};
+use crate::words::{self, Rng};
 
 /// extra characters allowed past the end of a word before input is ignored
 const MAX_OVERFLOW: usize = 10;
@@ -82,7 +82,6 @@ impl KeyStat {
 #[derive(Clone, Debug)]
 pub struct Summary {
     pub mode: Mode,
-    pub lang: Lang,
     pub wpm: f64,
     pub raw: f64,
     pub accuracy: f64,
@@ -95,7 +94,6 @@ pub struct Summary {
 
 pub struct Test {
     pub mode: Mode,
-    pub lang: Lang,
     pub words: Vec<Vec<char>>,
     /// what was typed for each word reached so far; the last entry is the current word
     pub typed: Vec<Vec<char>>,
@@ -111,7 +109,7 @@ pub struct Test {
 }
 
 impl Test {
-    pub fn new(mode: Mode, lang: Lang) -> Test {
+    pub fn new(mode: Mode) -> Test {
         let mut rng = Rng::seeded();
         let count = match mode {
             Mode::Time(_) => TIME_BATCH,
@@ -119,8 +117,7 @@ impl Test {
         };
         Test {
             mode,
-            lang,
-            words: words::generate(lang, count, &mut rng),
+            words: words::generate(count, &mut rng),
             typed: vec![Vec::new()],
             start: None,
             finished: None,
@@ -214,7 +211,7 @@ impl Test {
         if let Mode::Time(_) = self.mode
             && self.words.len() - self.typed.len() < TIME_BATCH / 2
         {
-            let more = words::generate(self.lang, TIME_BATCH, &mut self.rng);
+            let more = words::generate(TIME_BATCH, &mut self.rng);
             self.words.extend(more);
         }
     }
@@ -363,7 +360,6 @@ impl Test {
 
         Summary {
             mode: self.mode,
-            lang: self.lang,
             wpm: self.correct_chars() as f64 / 5.0 / mins,
             raw: typed_chars as f64 / 5.0 / mins,
             accuracy: self.live_accuracy(),
@@ -394,7 +390,7 @@ mod tests {
     use super::*;
 
     fn fixed(words: &[&str], mode: Mode) -> Test {
-        let mut t = Test::new(mode, Lang::En);
+        let mut t = Test::new(mode);
         t.words = words.iter().map(|w| w.chars().collect()).collect();
         t
     }
@@ -486,15 +482,6 @@ mod tests {
         let mut t = fixed(&["a", "b"], Mode::Words(2));
         type_str(&mut t, &"x".repeat(50));
         assert_eq!(t.typed[0].len(), 1 + MAX_OVERFLOW);
-    }
-
-    #[test]
-    fn mongolian_is_per_character() {
-        let mut t = Test::new(Mode::Words(1), Lang::Mn);
-        t.words = vec!["хөл".chars().collect()];
-        type_str(&mut t, "хөл");
-        assert!(t.is_finished());
-        assert_eq!(t.summary().chars.correct, 3);
     }
 
     #[test]

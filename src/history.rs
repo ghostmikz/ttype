@@ -13,6 +13,8 @@ use crate::test::{KeyStat, Summary};
 pub struct Record {
     pub timestamp: u64,
     pub mode: String,
+    /// every run is english now; older mongolian runs are kept on disk but ignored
+    #[serde(default = "english")]
     pub lang: String,
     pub wpm: f64,
     pub raw: f64,
@@ -46,22 +48,31 @@ impl History {
         History { path, records }
     }
 
-    pub fn best(&self, mode: &str, lang: &str) -> Option<f64> {
+    /// in-memory only, for tests that shouldn't touch ~/.local/share
+    #[cfg(test)]
+    pub fn empty() -> History {
+        History {
+            path: None,
+            records: Vec::new(),
+        }
+    }
+
+    pub fn best(&self, mode: &str) -> Option<f64> {
         self.records
             .iter()
-            .filter(|r| r.mode == mode && r.lang == lang)
+            .filter(|r| r.mode == mode && r.lang == LANG)
             .map(|r| r.wpm)
             .max_by(f64::total_cmp)
     }
 
-    /// key stats summed over every saved run in `lang`, plus how many runs had any
-    pub fn key_totals(&self, lang: &str) -> (BTreeMap<char, KeyStat>, usize) {
+    /// key stats summed over every saved run, plus how many runs had any
+    pub fn key_totals(&self) -> (BTreeMap<char, KeyStat>, usize) {
         let mut totals: BTreeMap<char, KeyStat> = BTreeMap::new();
         let mut runs = 0;
         for r in self
             .records
             .iter()
-            .filter(|r| r.lang == lang && !r.keys.is_empty())
+            .filter(|r| r.lang == LANG && !r.keys.is_empty())
         {
             runs += 1;
             for (&c, &[attempts, misses]) in &r.keys {
@@ -82,7 +93,7 @@ impl History {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             mode: s.mode.key(),
-            lang: s.lang.code().to_string(),
+            lang: LANG.to_string(),
             wpm: round2(s.wpm),
             raw: round2(s.raw),
             accuracy: round2(s.accuracy),
@@ -107,6 +118,12 @@ impl History {
     }
 }
 
+const LANG: &str = "en";
+
+fn english() -> String {
+    LANG.to_string()
+}
+
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -115,45 +132,55 @@ fn round2(x: f64) -> f64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn old_records_without_keys_still_load() {
-        let old = r#"{"timestamp":1,"mode":"time:30","lang":"en","wpm":90.0,"raw":95.0,"accuracy":97.0,"consistency":80.0}"#;
-        let r: Record = serde_json::from_str(old).unwrap();
-        assert!(r.keys.is_empty());
+    fn record(lang: &str, wpm: f64, keys: &[(char, [u32; 2])]) -> Record {
+        Record {
+            timestamp: 1,
+            mode: "words:25".into(),
+            lang: lang.into(),
+            wpm,
+            raw: wpm,
+            accuracy: 100.0,
+            consistency: 100.0,
+            keys: keys.iter().copied().collect(),
+        }
     }
 
     #[test]
-    fn keys_round_trip_including_cyrillic() {
-        let mut keys = BTreeMap::new();
-        keys.insert('ө', [12, 3]);
-        keys.insert('e', [40, 1]);
-        let r = Record {
-            timestamp: 1,
-            mode: "words:25".into(),
-            lang: "mn".into(),
-            wpm: 1.0,
-            raw: 1.0,
-            accuracy: 1.0,
-            consistency: 1.0,
-            keys,
-        };
+    fn old_records_without_keys_or_lang_still_load() {
+        let old = r#"{"timestamp":1,"mode":"time:30","wpm":90.0,"raw":95.0,"accuracy":97.0,"consistency":80.0}"#;
+        let r: Record = serde_json::from_str(old).unwrap();
+        assert!(r.keys.is_empty());
+        assert_eq!(r.lang, "en");
+    }
+
+    #[test]
+    fn keys_round_trip() {
+        let r = record("en", 1.0, &[('e', [40, 1])]);
         let json = serde_json::to_string(&r).unwrap();
         let back: Record = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.keys[&'ө'], [12, 3]);
+        assert_eq!(back.keys[&'e'], [40, 1]);
+    }
 
+    #[test]
+    fn old_mongolian_runs_are_ignored() {
         let h = History {
             path: None,
-            records: vec![back.clone(), back],
+            records: vec![
+                record("en", 80.0, &[('e', [10, 2])]),
+                record("en", 95.0, &[('e', [10, 1])]),
+                record("mn", 120.0, &[('ө', [10, 5])]),
+            ],
         };
-        let (totals, runs) = h.key_totals("mn");
+        assert_eq!(h.best("words:25"), Some(95.0));
+        let (totals, runs) = h.key_totals();
         assert_eq!(runs, 2);
         assert_eq!(
-            totals[&'ө'],
+            totals[&'e'],
             KeyStat {
-                attempts: 24,
-                misses: 6
+                attempts: 20,
+                misses: 3
             }
         );
-        assert_eq!(h.key_totals("en").1, 0);
+        assert!(!totals.contains_key(&'ө'));
     }
 }
