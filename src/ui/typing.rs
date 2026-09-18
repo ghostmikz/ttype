@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -102,7 +102,8 @@ fn progress(test: &Test) -> String {
 fn live_stats(app: &App) -> Span<'static> {
     let test = &app.test;
     let text = if test.start.is_some() {
-        format!("{:.0} wpm   {:.0}%", test.live_wpm(), test.live_accuracy())
+        let (wpm, accuracy) = test.shown_stats();
+        format!("{wpm:.0} wpm   {accuracy:.0}%")
     } else if let Some(b) = app.best {
         format!("best {b:.0} wpm")
     } else {
@@ -167,16 +168,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
+    // the terminal's own cursor is the caret: always visible, blinks like a
+    // real one, and drawing every frame is what makes it glide
     let row = f.caret_line.round() as isize - first as isize;
     let x = text.x + f.caret_col.round() as u16;
     if (0..VISIBLE_LINES as isize).contains(&row) && x < text.right() {
-        let y = text.y + row as u16 * pitch;
-        buf[(x, y)].set_style(
-            Style::new()
-                .fg(ACCENT)
-                .add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
-                .underline_color(ACCENT),
-        );
+        frame.set_cursor_position(Position::new(x, text.y + row as u16 * pitch));
     }
 }
 

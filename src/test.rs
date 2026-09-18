@@ -103,6 +103,9 @@ pub struct Test {
     errors: u32,
     sec_chars: u32,
     sec_errors: u32,
+    /// wpm/accuracy as of the last completed second; recomputing them every
+    /// frame makes the numbers flicker while you type
+    shown: (f64, f64),
     samples: Vec<Sample>,
     keys: BTreeMap<char, KeyStat>,
     rng: Rng,
@@ -125,6 +128,7 @@ impl Test {
             errors: 0,
             sec_chars: 0,
             sec_errors: 0,
+            shown: (0.0, 100.0),
             samples: Vec::new(),
             keys: BTreeMap::new(),
             rng,
@@ -283,6 +287,7 @@ impl Test {
             raw: self.sec_chars as f64 / 5.0 * 60.0,
             errors: self.sec_errors,
         });
+        self.shown = (wpm, self.live_accuracy());
         self.sec_chars = 0;
         self.sec_errors = 0;
     }
@@ -321,12 +326,9 @@ impl Test {
         n
     }
 
-    pub fn live_wpm(&self) -> f64 {
-        let mins = self.elapsed().as_secs_f64() / 60.0;
-        if mins < 1.0 / 60.0 {
-            return 0.0;
-        }
-        self.correct_chars() as f64 / 5.0 / mins
+    /// the numbers shown while typing: wpm and accuracy, one update per second
+    pub fn shown_stats(&self) -> (f64, f64) {
+        self.shown
     }
 
     pub fn live_accuracy(&self) -> f64 {

@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::cursor::SetCursorStyle;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
 
 use crate::history::History;
 use crate::test::{KeyStat, MODES, Mode, Summary, Test};
@@ -77,8 +79,17 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        // a bar caret sitting before the next letter, monkeytype style. not every
+        // terminal honours it, so a failure here isn't worth ending the run over.
+        let _ = execute!(std::io::stdout(), SetCursorStyle::BlinkingBar);
+        let result = self.event_loop(terminal);
+        let _ = execute!(std::io::stdout(), SetCursorStyle::DefaultUserShape);
+        result
+    }
+
+    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
         while !self.quit {
-            terminal.draw(|f| ui::draw(f, &self))?;
+            terminal.draw(|f| ui::draw(f, self))?;
             let wait = if self.motion.borrow().animating(Instant::now()) {
                 ANIMATION_FRAME
             } else {
@@ -169,7 +180,7 @@ impl App {
 mod tests {
     use super::*;
     use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{Backend, TestBackend};
     use ratatui::buffer::Buffer;
     use ratatui::style::{Color, Modifier};
 
@@ -184,9 +195,15 @@ mod tests {
     }
 
     fn render(app: &App, w: u16, h: u16) -> Buffer {
+        draw(app, w, h).0
+    }
+
+    /// the drawn screen plus where the caret (the terminal's cursor) ended up
+    fn draw(app: &App, w: u16, h: u16) -> (Buffer, (u16, u16)) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::draw(f, app)).unwrap();
-        term.backend().buffer().clone()
+        let caret = term.backend_mut().get_cursor_position().unwrap();
+        (term.backend().buffer().clone(), (caret.x, caret.y))
     }
 
     /// type the first `n` words, fumbling a couple of them
@@ -215,13 +232,6 @@ mod tests {
         app.test.tick();
         app.show_results();
         app
-    }
-
-    fn caret_cell(buf: &Buffer) -> Option<(u16, u16)> {
-        let i = buf.content().iter().position(|c| {
-            c.modifier.contains(Modifier::UNDERLINED) && c.underline_color == ui::ACCENT
-        })?;
-        Some((i as u16 % buf.area.width, i as u16 / buf.area.width))
     }
 
     #[test]
@@ -260,28 +270,56 @@ mod tests {
     #[test]
     fn caret_glides_instead_of_jumping() {
         let mut a = app(Mode::Words(25));
-        let (start, row) = caret_cell(&render(&a, 100, 30)).unwrap();
+        let (start, row) = draw(&a, 100, 30).1;
         let word: String = a.test.words[0].iter().collect();
         press(&mut a, &format!("{word} "));
         let target = start + word.len() as u16 + 1;
 
         // right after the keypress it has only started moving
-        let (moving, _) = caret_cell(&render(&a, 100, 30)).unwrap();
+        let (moving, _) = draw(&a, 100, 30).1;
         assert!(moving < target, "caret teleported to {moving}");
 
         std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(caret_cell(&render(&a, 100, 30)).unwrap(), (target, row));
+        assert_eq!(draw(&a, 100, 30).1, (target, row));
         assert!(!a.motion.borrow().animating(Instant::now()));
     }
 
     #[test]
     fn restart_puts_caret_straight_back() {
         let mut a = app(Mode::Words(25));
-        let home = caret_cell(&render(&a, 100, 30)).unwrap();
+        let home = draw(&a, 100, 30).1;
         type_some(&mut a, 3);
         render(&a, 100, 30);
         a.on_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(caret_cell(&render(&a, 100, 30)).unwrap(), home);
+        assert_eq!(draw(&a, 100, 30).1, home);
+    }
+
+    #[test]
+    fn live_numbers_only_change_once_a_second() {
+        let mut a = app(Mode::Time(30));
+        let line = |a: &App| {
+            let buf = render(a, 100, 30);
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .find(|row| row.contains("wpm"))
+                .expect("status line with the live numbers")
+        };
+        type_some(&mut a, 2);
+        let first = line(&a);
+        assert!(
+            first.contains("0 wpm"),
+            "no numbers before the first second: {first}"
+        );
+        type_some(&mut a, 2);
+        assert_eq!(line(&a), first, "numbers must hold until the second ticks");
+
+        a.test.start = Some(Instant::now() - Duration::from_secs(3));
+        a.test.tick();
+        assert_ne!(line(&a), first, "a completed second refreshes them");
     }
 
     fn css(c: Color, default: &str) -> String {
